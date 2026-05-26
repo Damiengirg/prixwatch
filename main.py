@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 import os
-import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -143,38 +142,134 @@ async def get_history(url: str, request: Request):
 
     return result
 
-@app.get("/wall")
-async def get_wall(request: Request):
+@app.get("/abuse")
+async def get_abuse(request: Request):
+    """
+    Retourne les sites classés par score d'abus (écart relatif max),
+    avec les produits les plus abusifs en exemple.
+    """
     db = request.app.state.db
-    rows = await db.fetch("""
-        SELECT 
+
+    # Score d'abus par site
+    site_rows = await db.fetch("""
+        SELECT
             platform,
-            AVG(price) as avg_price,
-            MIN(price) as min_price,
-            MAX(price) as max_price,
-            COUNT(*) as total
-        FROM price_observations
-        WHERE observed_at > NOW() - INTERVAL '30 days'
+            COUNT(DISTINCT product_url) as nb_produits,
+            COUNT(*) as nb_signalements,
+            ROUND(AVG(
+                CASE WHEN avg_p > 0 THEN (max_p - min_p) / avg_p ELSE 0 END
+            )::numeric, 4) as score_abus
+        FROM (
+            SELECT
+                platform,
+                product_url,
+                MIN(price) as min_p,
+                MAX(price) as max_p,
+                AVG(price) as avg_p
+            FROM price_observations
+            GROUP BY platform, product_url
+            HAVING COUNT(*) >= 2
+        ) sub
         GROUP BY platform
-        ORDER BY (MAX(price) - MIN(price)) / NULLIF(AVG(price), 0) DESC
+        ORDER BY score_abus DESC
     """)
-    return [
-        {
-            "platform": r["platform"],
-            "avg_price": round(float(r["avg_price"]), 2),
-            "min_price": round(float(r["min_price"]), 2),
-            "max_price": round(float(r["max_price"]), 2),
-            "observations": r["total"]
-        }
-        for r in rows
-    ]
+
+    result = []
+    for site in site_rows:
+        platform = site["platform"]
+        score = float(site["score_abus"] or 0)
+
+        # Note sur 10 (score 0.5 = 10/10 d'abus)
+        note = min(10.0, round(score * 20, 1))
+
+        # Top 3 produits les plus abusifs pour ce site
+        produit_rows = await db.fetch("""
+            SELECT
+                product_url,
+                product_name,
+                MIN(price) as min_p,
+                MAX(price) as max_p,
+                AVG(price) as avg_p,
+                COUNT(*) as nb,
+                ROUND(((MAX(price) - MIN(price)) / NULLIF(AVG(price), 0) * 100)::numeric, 1) as ecart_pct
+            FROM price_observations
+            WHERE platform = $1
+            GROUP BY product_url, product_name
+            HAVING COUNT(*) >= 2
+            ORDER BY ecart_pct DESC
+            LIMIT 3
+        """, platform)
+
+        produits = []
+        for p in produit_rows:
+            produits.append({
+                "url": p["product_url"],
+                "name": p["product_name"],
+                "min": round(float(p["min_p"]), 2),
+                "max": round(float(p["max_p"]), 2),
+                "avg": round(float(p["avg_p"]), 2),
+                "ecart_pct": float(p["ecart_pct"] or 0),
+                "nb_signalements": p["nb"],
+            })
+
+        result.append({
+            "platform": platform,
+            "score_abus": score,
+            "note_abus": note,
+            "nb_produits": site["nb_produits"],
+            "nb_signalements": site["nb_signalements"],
+            "produits_abusifs": produits,
+        })
+
+    return result
+
+@app.get("/catalogue")
+async def get_catalogue(request: Request, platform: str = None):
+    """
+    Retourne tous les produits groupés par plateforme et catégorie.
+    Si platform est fourni, filtre par plateforme.
+    """
+    db = request.app.state.db
+
+    query = """
+        SELECT
+            platform,
+            product_url,
+            product_name,
+            MIN(price) as min_p,
+            MAX(price) as max_p,
+            AVG(price) as avg_p,
+            COUNT(*) as nb,
+            MAX(observed_at) as last_seen
+        FROM price_observations
+    """
+    if platform:
+        query += " WHERE platform = $1 GROUP BY platform, product_url, product_name ORDER BY platform, product_name"
+        rows = await db.fetch(query, platform)
+    else:
+        query += " GROUP BY platform, product_url, product_name ORDER BY platform, product_name"
+        rows = await db.fetch(query)
+
+    # Grouper par plateforme
+    catalogue = {}
+    for r in rows:
+        p = r["platform"]
+        if p not in catalogue:
+            catalogue[p] = []
+        catalogue[p].append({
+            "url": r["product_url"],
+            "name": r["product_name"],
+            "min": round(float(r["min_p"]), 2),
+            "max": round(float(r["max_p"]), 2),
+            "avg": round(float(r["avg_p"]), 2),
+            "nb_signalements": r["nb"],
+            "last_seen": r["last_seen"].isoformat(),
+        })
+
+    return catalogue
 
 @app.get("/trending")
 async def get_trending(request: Request):
-    """
-    Retourne les 5 produits les plus signalés
-    pour la collecte automatique en arrière-plan
-    """
     db = request.app.state.db
     rows = await db.fetch("""
         SELECT 
